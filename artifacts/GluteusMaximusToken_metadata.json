@@ -580,11 +580,11 @@
 			]
 		},
 		"GluteusMaximusToken.sol": {
-			"keccak256": "0xdc3955633e227cb2a4c22acce74f343e9cbd1b3a5a1240c9aca7d7521c50c7ab",
+			"keccak256": "0xaa504699e46be4be24369ad020347456775b3d74a833261ba0ee385f9a8b728c",
 			"license": "MIT",
 			"urls": [
-				"bzz-raw://55a402a6ee7fd6694c2610e0f5b9bf3f733783f35644329e57f58589eb4ddda6",
-				"dweb:/ipfs/QmVK3LVrbARW2Rdka54BoUyY6Vd2Sp7JsBABJU3uvgACUe"
+				"bzz-raw://bd35b23df6e62636847880db719ab53295ae633fc36c33fcba3e8beb7c6c69db",
+				"dweb:/ipfs/QmYWYEWSQKrwcas2wDpS5eCcxTZCFEi1zk1ngaw42rzUAr"
 			]
 		}
 	},

@@ -48,7 +48,9 @@ import {VRFConsumerBaseV2Plus} from "@chainlink/contracts/src/v0.8/vrf/dev/VRFCo
 import {VRFV2PlusClient} from "@chainlink/contracts/src/v0.8/vrf/dev/libraries/VRFV2PlusClient.sol";
 
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
 import "./SenatorNFTCollection.sol";
 
 /**
@@ -66,6 +68,8 @@ import "./SenatorNFTCollection.sol";
  * Author: The Consul @ Gluteus Maximus
  */
 contract StakingGLUTEU is VRFConsumerBaseV2Plus, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
     // ========== CHAINLINK VRF SETTINGS ==========
 
     /// @notice VRF v2.5 subscription ID
@@ -193,8 +197,7 @@ contract StakingGLUTEU is VRFConsumerBaseV2Plus, ReentrancyGuard {
      *         We also store requestId in userRequests[user].
      */
     function stakeAndGetNFT() external nonReentrant returns (uint256 requestId) {
-        bool success = gluteuToken.transferFrom(msg.sender, address(this), STAKE_AMOUNT);
-        require(success, "GLUTEU transfer failed");
+        gluteuToken.safeTransferFrom(msg.sender, address(this), STAKE_AMOUNT);
         require(availableIds.length > 0, "No more IDs available");
 
         emit StakeAndGetNFTCalled(msg.sender, block.timestamp);
@@ -274,8 +277,7 @@ contract StakingGLUTEU is VRFConsumerBaseV2Plus, ReentrancyGuard {
             sr.claimed = false;
             sr.randomReady = false;
 
-            bool success = gluteuToken.transfer(msg.sender, STAKE_AMOUNT);
-            require(success, "Refund failed");
+            gluteuToken.safeTransfer(msg.sender, STAKE_AMOUNT);
 
             emit PoolExhaustedRefund(msg.sender, requestId);
             return;
@@ -318,8 +320,7 @@ contract StakingGLUTEU is VRFConsumerBaseV2Plus, ReentrancyGuard {
         require(!sr.randomReady, "Random assigned; can't forfeit now");
 
         sr.stakeActive = false;
-        bool success = gluteuToken.transfer(msg.sender, STAKE_AMOUNT);
-        require(success, "Refund failed");
+        gluteuToken.safeTransfer(msg.sender, STAKE_AMOUNT);
 
         emit UnstakeNoNFT(msg.sender, requestId);
     }
@@ -341,8 +342,7 @@ contract StakingGLUTEU is VRFConsumerBaseV2Plus, ReentrancyGuard {
         nftContract.burnWithId(tokenId);
         availableIds.push(tokenId);
 
-        bool success = gluteuToken.transfer(msg.sender, STAKE_AMOUNT);
-        require(success, "GLUTEU refund failed");
+        gluteuToken.safeTransfer(msg.sender, STAKE_AMOUNT);
 
         delete mintedTimestamp[tokenId];
         emit SenatorBurned(msg.sender, tokenId);
