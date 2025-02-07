@@ -302,6 +302,19 @@
 			},
 			{
 				"inputs": [],
+				"name": "MIN_NO_NFT_WAIT",
+				"outputs": [
+					{
+						"internalType": "uint256",
+						"name": "",
+						"type": "uint256"
+					}
+				],
+				"stateMutability": "view",
+				"type": "function"
+			},
+			{
+				"inputs": [],
 				"name": "STAKE_AMOUNT",
 				"outputs": [
 					{
@@ -677,23 +690,20 @@
 			"methods": {
 				"constructor": {
 					"params": {
-						"_callbackGasLimit": "How much gas for fulfill",
-						"_gluteuToken": "Address of GLUTEU (ERC20)",
-						"_keyHash": "The VRF gas lane",
-						"_nftContract": "Address of SenatorNFTCollection",
-						"_requestConfirmations": "Blocks to wait",
+						"_callbackGasLimit": "callback gas",
+						"_gluteuToken": "GLUTEU token address",
+						"_keyHash": "chainlink gas lane",
+						"_nftContract": "SenatorNFTCollection address",
+						"_requestConfirmations": "how many confirmations",
 						"_subscriptionId": "VRF subscription ID",
-						"_vrfCoordinator": "Chainlink VRF v2.5 coordinator",
-						"_waitPeriod": "Lock time in seconds"
+						"_vrfCoordinator": "VRF v2.5 coordinator",
+						"_waitPeriod": "lock time in seconds for minted NFT"
 					}
-				}
-			},
-			"stateVariables": {
-				"gluteuToken": {
-					"details": "1 million staked per NFT"
 				},
-				"nftContract": {
-					"details": "SenatorNFTCollection with 500 possible IDs"
+				"unstakeNoNFT(uint256)": {
+					"params": {
+						"requestId": "The stake request ID to cancel"
+					}
 				}
 			},
 			"title": "StakingGLUTEU",
@@ -702,6 +712,9 @@
 		"userdoc": {
 			"kind": "user",
 			"methods": {
+				"MIN_NO_NFT_WAIT()": {
+					"notice": "The user must wait this many seconds (1 hour)          before they can call unstakeNoNFT if VRF hasn't arrived.         This prevents immediate MEV-based \"reroll\" attempts."
+				},
 				"STAKE_AMOUNT()": {
 					"notice": "Each Senator costs 1,000,000 GLUTEU"
 				},
@@ -712,19 +725,25 @@
 					"notice": "Gas limit for fulfillRandomWords callback"
 				},
 				"claimNFT(uint256)": {
-					"notice": "If VRF succeeded, user calls claim to finalize.          If the pool is empty at that moment, we refund them immediately."
+					"notice": "If VRF arrived, user calls claim to finalize.          If the pool is empty, we refund them (no NFT minted)."
 				},
 				"getAvailableIds()": {
-					"notice": "Return the array of available IDs"
+					"notice": "Return the array of currently available IDs"
 				},
 				"getUserRequests(address)": {
-					"notice": "Return all requestIds for a given user"
+					"notice": "Return all requestIds for a given user."
+				},
+				"gluteuToken()": {
+					"notice": "1 million staked per NFT"
 				},
 				"keyHash()": {
-					"notice": "KeyHash (gas lane) for VRF"
+					"notice": "The Chainlink VRF gas lane (keyHash)"
 				},
 				"mintedTimestamp(uint256)": {
-					"notice": "mintedTimestamp[tokenId] = block.timestamp          so the current holder can burn after waitPeriod"
+					"notice": "mintedTimestamp[tokenId] = block.timestamp         so the holder can burn after waitPeriod"
+				},
+				"nftContract()": {
+					"notice": "The Senator NFT Collection (max 500 IDs)"
 				},
 				"owner()": {
 					"notice": "Get the current owner"
@@ -739,10 +758,10 @@
 					"notice": "Sets the VRF Coordinator addressThis method should only be callable by the coordinator or contract owner"
 				},
 				"setWaitPeriod(uint256)": {
-					"notice": "Adjust waitPeriod if needed (onlyOwner)"
+					"notice": "Adjust waitPeriod if needed (onlyOwner)."
 				},
 				"stakeAndGetNFT()": {
-					"notice": "The user stakes 1M GLUTEU and requests VRF for 1 random word.         If VRF fails, they can unstakeNoNFT.          We also store requestId in userRequests[user]."
+					"notice": "User stakes 1M GLUTEU and requests randomness.         If VRF fails, they can unstakeNoNFT (only after 1 hour).         We also store the requestId in userRequests[user] for tracking."
 				},
 				"stakes(uint256)": {
 					"notice": "requestId => StakeRequest"
@@ -751,19 +770,19 @@
 					"notice": "Allows an owner to begin transferring ownership to a new address."
 				},
 				"unstakeAndBurnNFT(uint256)": {
-					"notice": "The current NFT owner can burn after `waitPeriod` to reclaim 1M GLUTEU.         ID reenters the pool for future mint."
+					"notice": "The NFT owner (whoever holds it) can burn after `waitPeriod`         to reclaim 1 million GLUTEU, re-adding the tokenId to the pool."
 				},
 				"unstakeNoNFT(uint256)": {
-					"notice": "If VRF never arrived, user can recover 1M GLUTEU.          Not allowed if randomReady=true => no re-rolling."
+					"notice": "If the VRF never arrived (randomReady=false), user can unstake after          at least 1 hour. This stops immediate MEV watchers from \"rerolling\"          if they see an unfavorable random in the mempool."
 				},
 				"updateVRFSettings(bytes32,uint16,uint32)": {
-					"notice": "Update VRF config if needed"
+					"notice": "Update VRF config if needed (onlyOwner)."
 				},
 				"waitPeriod()": {
-					"notice": "Seconds to wait before the minted NFT can be burned"
+					"notice": "Seconds to wait before a minted NFT can be burned"
 				}
 			},
-			"notice": "Non-upgradeable contract to stake 1M GLUTEU for 1 random Senator NFT         using a two-phase approach and edge-case handling if the pool is exhausted. - If VRF never arrives, user can `unstakeNoNFT`. - If VRF arrives and pool has IDs, user calls `claimNFT(requestId)`. - If VRF arrives but the pool is empty, the contract auto-refunds user    in the same `claimNFT` call (no NFT minted). - Minted NFTs lock 1M GLUTEU until `unstakeAndBurnNFT(tokenId)` after `waitPeriod`. - `userRequests[user]` array to let each user see all their VRF requests. Gluteus Maximus",
+			"notice": "Non-upgradeable contract to stake 1M GLUTEU for 1 random Senator NFT         using a two-phase approach and edge-case handling if the pool is exhausted,         plus a 1-hour cooldown before unstakeNoNFT can be called. Gluteus Maximus",
 			"version": 1
 		}
 	},
@@ -1024,11 +1043,11 @@
 			]
 		},
 		"StakingGLUTEU.sol": {
-			"keccak256": "0x2b4355524ec8b7397558cf45e252a7f34612547557eb83178287e9f05033f8cc",
+			"keccak256": "0xd9b8185526c428b8d70cd194a8123744a4ed0e25a585fb32c8e8e980818984a0",
 			"license": "MIT",
 			"urls": [
-				"bzz-raw://bcb2da0d153a67f38fb628659420eef821d79d09a0ed796c96df9bb3d36f1f3b",
-				"dweb:/ipfs/QmSUDvMkDFHRZpUeqhTgNsVzpNroby15NVoQEzmr8wSaUn"
+				"bzz-raw://88409578d83ddc89b700f437ae0e922769836eaaf2a2799cd4dc2dfb8b697e13",
+				"dweb:/ipfs/QmUAiB99q3fR585KKiWDtZuYieSiv9UkUZMUee63qnppL8"
 			]
 		}
 	},

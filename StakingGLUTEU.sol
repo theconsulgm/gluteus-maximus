@@ -5,41 +5,43 @@ pragma solidity ^0.8.19;
    ----------------------------------------------------------------------------
    Authored by The Consul @ Gluteus Maximus
 
-   COMPLETE FLOW:
+   COMPLETE FLOW WITH 1-HOUR UNSTAKE NO-NFT COOLDOWN:
 
    1) stakeAndGetNFT():
-      - User stakes 1 million GLUTEU and requests 1 random word via Chainlink VRF.
+      - The user stakes 1 million GLUTEU and requests 1 random word from Chainlink VRF.
       - We store a "StakeRequest" in `stakes[requestId]`.
-      - Also store `requestId` in `userRequests[user]`, so the user can track all their requests.
+      - We also append `requestId` to `userRequests[user]` so the user can keep track of
+        all their requests.
 
    2) fulfillRandomWords():
-      - The Chainlink VRF callback sets `randomWord` and `randomReady=true`.
-      - We do NOT mint here to avoid potential out-of-gas issues.
+      - The Chainlink VRF callback sets `randomWord` and `randomReady=true` in `stakes[requestId]`.
+      - We do NOT mint here (to avoid potential out-of-gas or revert issues).
 
    3) claimNFT(requestId):
-      - If the pool has at least 1 available ID, the user mints the assigned ID.
-      - If the pool is exhausted (0 left), we automatically refund the user’s 1 million GLUTEU
-        in the same call, marking stake as inactive. This handles the edge case where the user
-        was "late" to claim and all 500 IDs were already taken.
+      - If the pool (`availableIds`) has at least 1 ID left, we mint the assigned ID to the user.
+      - If the pool is exhausted (0 IDs left), we automatically refund the user's 1 million GLUTEU
+        in this same call (so they aren't permanently locked).
 
    4) unstakeNoNFT(requestId):
-      - If `randomReady=false` (VRF never arrived), the user can reclaim their 1 million GLUTEU
-        without an NFT. This prevents permanently locked tokens if the callback fails.
-      - If `randomReady=true`, the user CANNOT unstakeNoNFT (no "reroll" if the random is assigned).
+      - Allowed **only** if `randomReady=false` (meaning the VRF callback never arrived).
+      - Additionally, we require **at least 1 hour** to have passed since `stakeAndGetNFT` was called
+        (`block.timestamp >= stakedAt + MIN_NO_NFT_WAIT`).
+      - If these conditions are met, we refund the 1 million GLUTEU without minting an NFT.
+      - This solves the scenario where VRF fails, but also prevents immediate "front-running"
+        if the user doesn't like the random result in the mempool.
 
    5) unstakeAndBurnNFT(tokenId):
-      - After waiting `waitPeriod` seconds from mint time, the current owner of the NFT
-        (transferable!) can burn it to reclaim 1 million GLUTEU. That `tokenId` then reenters
-        the pool (`availableIds`).
+      - After waiting `waitPeriod` seconds from the NFT's mint time, **whoever** owns the NFT
+        (it is transferrable) can burn it to reclaim 1 million GLUTEU.
+      - The tokenId then reenters the pool (`availableIds`).
 
-   SOLVES "POOL EXHAUSTION" + "VRF FAIL" ISSUES:
-   - If VRF fails, user calls `unstakeNoNFT`.
-   - If VRF succeeds but pool is empty when user calls `claimNFT`, we auto-refund.
-   - No leftover-withdraw function. The only ways to remove GLUTEU are:
-     * UnstakeNoNFT (if random not assigned) 
-     * Claim the NFT and later burn it 
-     * Automatic refund if pool is exhausted in `claimNFT`.
-   - The userRequests mapping helps users see all their pending or used requestIds.
+   SOLUTIONS TO SECURITY & EDGE CASES:
+   - No permanent lock if VRF fails (`unstakeNoNFT`).
+   - No leftover withdrawal function that might drain user stakes.
+   - If the pool is full at the time of claim, user is auto-refunded.
+   - The user cannot "reroll" once VRF is assigned because `unstakeNoNFT` is disallowed if `randomReady=true`.
+   - We add a **1-hour** (3600 seconds) minimum wait before calling `unstakeNoNFT` to stop MEV watchers
+     from front-running the VRF call if they see an undesired random result.
 
    ----------------------------------------------------------------------------
 */
@@ -56,26 +58,20 @@ import "./SenatorNFTCollection.sol";
 /**
  * @title StakingGLUTEU
  * @notice Non-upgradeable contract to stake 1M GLUTEU for 1 random Senator NFT
- *         using a two-phase approach and edge-case handling if the pool is exhausted.
- *
- * - If VRF never arrives, user can `unstakeNoNFT`.
- * - If VRF arrives and pool has IDs, user calls `claimNFT(requestId)`.
- * - If VRF arrives but the pool is empty, the contract auto-refunds user 
- *   in the same `claimNFT` call (no NFT minted).
- * - Minted NFTs lock 1M GLUTEU until `unstakeAndBurnNFT(tokenId)` after `waitPeriod`.
- * - `userRequests[user]` array to let each user see all their VRF requests.
+ *         using a two-phase approach and edge-case handling if the pool is exhausted,
+ *         plus a 1-hour cooldown before unstakeNoNFT can be called.
  *
  * Author: The Consul @ Gluteus Maximus
  */
 contract StakingGLUTEU is VRFConsumerBaseV2Plus, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
-    // ========== CHAINLINK VRF SETTINGS ==========
+    // ================== VRF CONFIG ==================
 
     /// @notice VRF v2.5 subscription ID
     uint256 public s_subscriptionId;
 
-    /// @notice KeyHash (gas lane) for VRF
+    /// @notice The Chainlink VRF gas lane (keyHash)
     bytes32 public keyHash;
 
     /// @notice How many block confirmations VRF should wait
@@ -84,37 +80,44 @@ contract StakingGLUTEU is VRFConsumerBaseV2Plus, ReentrancyGuard {
     /// @notice Gas limit for fulfillRandomWords callback
     uint32 public callbackGasLimit;
 
-    // ========== TOKEN + NFT REFERENCES ==========
+    // ================== TOKEN + NFT ==================
 
-    /// @dev 1 million staked per NFT
+    /// @notice 1 million staked per NFT
     IERC20 public immutable gluteuToken;
 
-    /// @dev SenatorNFTCollection with 500 possible IDs
+    /// @notice The Senator NFT Collection (max 500 IDs)
     SenatorNFTCollection public immutable nftContract;
 
-    // ========== STAKING + WAIT PERIOD ==========
+    // ================== STAKING + WAIT PERIOD ==================
 
     /// @notice Each Senator costs 1,000,000 GLUTEU
     uint256 public constant STAKE_AMOUNT = 1_000_000 * 10**18;
 
-    /// @notice Seconds to wait before the minted NFT can be burned
+    /// @notice Seconds to wait before a minted NFT can be burned
     uint256 public waitPeriod;
 
-    // ========== ID POOL ==========
+    /**
+     * @notice The user must wait this many seconds (1 hour) 
+     *         before they can call unstakeNoNFT if VRF hasn't arrived.
+     *         This prevents immediate MEV-based "reroll" attempts.
+     */
+    uint256 public constant MIN_NO_NFT_WAIT = 3600;
 
-    /// @notice The pool of available IDs [1..500]
+    // ================== ID POOL ==================
+
+    /// @notice The pool of currently available IDs [1..500]
     uint256[] private availableIds;
 
-    // ========== STAKE REQUESTS DATA ==========
+    // ================== STAKE REQUEST DATA ==================
 
     /**
-     * @notice Each VRF request -> a StakeRequest storing:
-     *  - staker: the user who staked
-     *  - stakedAt: block.timestamp of staking
-     *  - stakeActive: user hasn't unstaked or minted
-     *  - randomReady: VRF arrived with a randomWord
-     *  - claimed: user minted the NFT
-     *  - randomWord: the random assigned
+     * @notice Each VRF request => one StakeRequest
+     *         - staker: user who called stakeAndGetNFT
+     *         - stakedAt: block.timestamp of that call
+     *         - stakeActive: user hasn't unstaked or minted
+     *         - randomReady: VRF arrived
+     *         - claimed: user minted the NFT
+     *         - randomWord: the random assigned
      */
     struct StakeRequest {
         address staker;
@@ -129,17 +132,17 @@ contract StakingGLUTEU is VRFConsumerBaseV2Plus, ReentrancyGuard {
     mapping(uint256 => StakeRequest) public stakes;
 
     /**
-     * @notice mintedTimestamp[tokenId] = block.timestamp 
-     *         so the current holder can burn after waitPeriod
+     * @notice mintedTimestamp[tokenId] = block.timestamp
+     *         so the holder can burn after waitPeriod
      */
     mapping(uint256 => uint256) public mintedTimestamp;
 
     /**
-     * @notice userRequests[user] = array of requestIds for that user
+     * @notice userRequests[user] => array of all requestIds from that user
      */
     mapping(address => uint256[]) private userRequests;
 
-    // ========== EVENTS ==========
+    // ================== EVENTS ==================
 
     event StakeAndGetNFTCalled(address indexed user, uint256 timestamp);
     event VRFRequested(uint256 indexed requestId, address indexed user);
@@ -149,17 +152,17 @@ contract StakingGLUTEU is VRFConsumerBaseV2Plus, ReentrancyGuard {
     event UnstakeNoNFT(address indexed user, uint256 indexed requestId);
     event SenatorBurned(address indexed holder, uint256 indexed tokenId);
 
-    // ========== CONSTRUCTOR ==========
+    // ================== CONSTRUCTOR ==================
 
     /**
      * @param _subscriptionId VRF subscription ID
-     * @param _gluteuToken    Address of GLUTEU (ERC20)
-     * @param _nftContract    Address of SenatorNFTCollection
-     * @param _vrfCoordinator Chainlink VRF v2.5 coordinator
-     * @param _keyHash        The VRF gas lane
-     * @param _requestConfirmations Blocks to wait
-     * @param _callbackGasLimit How much gas for fulfill
-     * @param _waitPeriod     Lock time in seconds
+     * @param _gluteuToken    GLUTEU token address
+     * @param _nftContract    SenatorNFTCollection address
+     * @param _vrfCoordinator VRF v2.5 coordinator
+     * @param _keyHash        chainlink gas lane
+     * @param _requestConfirmations how many confirmations
+     * @param _callbackGasLimit callback gas
+     * @param _waitPeriod     lock time in seconds for minted NFT
      */
     constructor(
         uint256 _subscriptionId,
@@ -192,11 +195,12 @@ contract StakingGLUTEU is VRFConsumerBaseV2Plus, ReentrancyGuard {
     //   1) STAKE & REQUEST VRF
     // ===================================================
     /**
-     * @notice The user stakes 1M GLUTEU and requests VRF for 1 random word.
-     *         If VRF fails, they can unstakeNoNFT. 
-     *         We also store requestId in userRequests[user].
+     * @notice User stakes 1M GLUTEU and requests randomness.
+     *         If VRF fails, they can unstakeNoNFT (only after 1 hour).
+     *         We also store the requestId in userRequests[user] for tracking.
      */
     function stakeAndGetNFT() external nonReentrant returns (uint256 requestId) {
+        // Transfer 1M from user
         gluteuToken.safeTransferFrom(msg.sender, address(this), STAKE_AMOUNT);
         require(availableIds.length > 0, "No more IDs available");
 
@@ -209,7 +213,7 @@ contract StakingGLUTEU is VRFConsumerBaseV2Plus, ReentrancyGuard {
             requestConfirmations: requestConfirmations,
             callbackGasLimit: callbackGasLimit,
             numWords: 1,
-            // If paying in LINK => false, if paying in native => true
+            // If paying in LINK => nativePayment=false, if paying in native => true
             extraArgs: VRFV2PlusClient._argsToBytes(
                 VRFV2PlusClient.ExtraArgsV1({nativePayment: false})
             )
@@ -226,7 +230,7 @@ contract StakingGLUTEU is VRFConsumerBaseV2Plus, ReentrancyGuard {
             randomWord: 0
         });
 
-        // track it for user
+        // Track requestId for user
         userRequests[msg.sender].push(requestId);
 
         emit VRFRequested(requestId, msg.sender);
@@ -237,7 +241,7 @@ contract StakingGLUTEU is VRFConsumerBaseV2Plus, ReentrancyGuard {
     //   2) VRF CALLBACK (STORE RANDOM)
     // ===================================================
     /**
-     * @dev We store the randomWord, mark randomReady=true, no mint here
+     * @dev We store the randomWord, set randomReady=true. No mint to avoid reverts.
      */
     function fulfillRandomWords(
         uint256 _requestId,
@@ -245,7 +249,7 @@ contract StakingGLUTEU is VRFConsumerBaseV2Plus, ReentrancyGuard {
     ) internal override {
         StakeRequest storage sr = stakes[_requestId];
         if (sr.staker == address(0) || !sr.stakeActive || sr.randomReady) {
-            // either invalid, or user canceled, or already set
+            // either invalid, or user canceled, or already assigned
             return;
         }
 
@@ -256,11 +260,11 @@ contract StakingGLUTEU is VRFConsumerBaseV2Plus, ReentrancyGuard {
     }
 
     // ===================================================
-    //   3) CLAIM NFT or GET REFUND IF POOL EMPTY
+    //   3) CLAIM NFT or REFUND IF POOL EMPTY
     // ===================================================
     /**
-     * @notice If VRF succeeded, user calls claim to finalize. 
-     *         If the pool is empty at that moment, we refund them immediately.
+     * @notice If VRF arrived, user calls claim to finalize. 
+     *         If the pool is empty, we refund them (no NFT minted).
      */
     function claimNFT(uint256 requestId) external nonReentrant {
         StakeRequest storage sr = stakes[requestId];
@@ -271,14 +275,12 @@ contract StakingGLUTEU is VRFConsumerBaseV2Plus, ReentrancyGuard {
 
         uint256 numAvailable = availableIds.length;
         if (numAvailable == 0) {
-            // The user missed out, all minted. 
-            // Auto-refund to avoid permanent lock
+            // Edge case: pool exhausted => auto-refund
             sr.stakeActive = false;
             sr.claimed = false;
             sr.randomReady = false;
 
             gluteuToken.safeTransfer(msg.sender, STAKE_AMOUNT);
-
             emit PoolExhaustedRefund(msg.sender, requestId);
             return;
         }
@@ -296,7 +298,7 @@ contract StakingGLUTEU is VRFConsumerBaseV2Plus, ReentrancyGuard {
 
         sr.claimed = true;
 
-        // Mint
+        // Mint the NFT
         nftContract.mintWithId(msg.sender, tokenId);
 
         // record minted time
@@ -306,18 +308,23 @@ contract StakingGLUTEU is VRFConsumerBaseV2Plus, ReentrancyGuard {
     }
 
     // ===================================================
-    //   4) UNSTAKE NO NFT (IF randomReady=false)
+    //   4) UNSTAKE NO NFT (IF randomReady=false, AFTER 1 HOUR)
     // ===================================================
     /**
-     * @notice If VRF never arrived, user can recover 1M GLUTEU. 
-     *         Not allowed if randomReady=true => no re-rolling.
+     * @notice If the VRF never arrived (randomReady=false), user can unstake after 
+     *         at least 1 hour. This stops immediate MEV watchers from "rerolling" 
+     *         if they see an unfavorable random in the mempool.
+     *
+     * @param requestId The stake request ID to cancel
      */
     function unstakeNoNFT(uint256 requestId) external nonReentrant {
         StakeRequest storage sr = stakes[requestId];
         require(sr.staker == msg.sender, "Not your stake");
-        require(sr.stakeActive, "Inactive or used");
-        require(!sr.claimed, "Already claimed");
+        require(sr.stakeActive, "Already inactive or used");
+        require(!sr.claimed, "Already claimed NFT");
         require(!sr.randomReady, "Random assigned; can't forfeit now");
+        // The critical new line: must wait >= 1 hour since staked
+        require(block.timestamp >= sr.stakedAt + MIN_NO_NFT_WAIT, "Must wait 1 hour to unstakeNoNFT");
 
         sr.stakeActive = false;
         gluteuToken.safeTransfer(msg.sender, STAKE_AMOUNT);
@@ -329,8 +336,8 @@ contract StakingGLUTEU is VRFConsumerBaseV2Plus, ReentrancyGuard {
     //   5) UNSTAKE & BURN NFT (TRANSFERABLE)
     // ===================================================
     /**
-     * @notice The current NFT owner can burn after `waitPeriod` to reclaim 1M GLUTEU.
-     *         ID reenters the pool for future mint.
+     * @notice The NFT owner (whoever holds it) can burn after `waitPeriod`
+     *         to reclaim 1 million GLUTEU, re-adding the tokenId to the pool.
      */
     function unstakeAndBurnNFT(uint256 tokenId) external nonReentrant {
         require(nftContract.ownerOf(tokenId) == msg.sender, "Not NFT owner");
@@ -338,7 +345,6 @@ contract StakingGLUTEU is VRFConsumerBaseV2Plus, ReentrancyGuard {
         require(mintedTime != 0, "Invalid token");
         require(block.timestamp >= mintedTime + waitPeriod, "Wait period not met");
 
-        // burn
         nftContract.burnWithId(tokenId);
         availableIds.push(tokenId);
 
@@ -352,31 +358,31 @@ contract StakingGLUTEU is VRFConsumerBaseV2Plus, ReentrancyGuard {
     //   VIEW: GET USER REQUESTS
     // ===================================================
     /**
-     * @notice Return all requestIds for a given user
+     * @notice Return all requestIds for a given user.
      */
     function getUserRequests(address user) external view returns (uint256[] memory) {
         return userRequests[user];
     }
 
     /**
-     * @notice Return the array of available IDs
+     * @notice Return the array of currently available IDs
      */
     function getAvailableIds() external view returns (uint256[] memory) {
         return availableIds;
     }
 
     // ===================================================
-    //   OWNER-LIKE FUNCTIONS (CHAINLINK)
+    //   OWNER-LIKE FUNCTIONS (Chainlink style)
     // ===================================================
     /**
-     * @notice Adjust waitPeriod if needed (onlyOwner)
+     * @notice Adjust waitPeriod if needed (onlyOwner).
      */
     function setWaitPeriod(uint256 newWait) external onlyOwner {
         waitPeriod = newWait;
     }
 
     /**
-     * @notice Update VRF config if needed
+     * @notice Update VRF config if needed (onlyOwner).
      */
     function updateVRFSettings(
         bytes32 newKeyHash,
